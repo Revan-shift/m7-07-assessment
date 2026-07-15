@@ -1,0 +1,455 @@
+openapi: "3.1.0"
+
+info:
+  title: Retail Recommendation Service API
+  version: "1.0.0"
+  description: |
+    Personalized product recommendation service for a B2C mobile retail application.
+
+    ## Endpoints
+    - **POST /v1/recommend** — Sync (primary): real-time recommendation for a single user
+    - **POST /v1/recommend/batch** — Batch: synchronous bulk recommendation for up to 500 users
+    - **POST /v1/recommend/async** — Async: webhook-callback pattern for large bulk jobs
+
+    ## Observability Headers
+    Every response includes:
+    - `X-Model-Version`: active model version (matches MLflow registry)
+    - `X-Request-ID`: unique request identifier for distributed tracing
+    - `X-Experiment-ID`: A/B test bucket ID (injected by the traffic splitter)
+    - `X-Serving-Latency-Ms`: inference + feature lookup time in milliseconds
+
+    `X-Model-Version` is cross-checked against the Prometheus metric
+    `recommendation_model_version_info` by the `ModelVersionMismatch` alert
+    defined in `monitoring/alerts.yaml`.
+
+servers:
+  - url: https://api.company.com
+    description: Production
+  - url: https://api.staging.company.com
+    description: Staging
+
+security:
+  - BearerAuth: []
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+
+    RecommendationItem:
+      type: object
+      required: [item_id, score, rank]
+      properties:
+        item_id:
+          type: string
+          description: Product identifier in the catalog
+          example: "prod-8821-sneakers-blue"
+        score:
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          description: Model relevance score (ANN cosine similarity)
+          example: 0.912
+        rank:
+          type: integer
+          minimum: 1
+          description: Position in the ranked list (1 = most relevant)
+          example: 1
+        metadata:
+          type: object
+          description: Optional enrichment data from the feature store
+          properties:
+            category: { type: string, example: "footwear" }
+            brand: { type: string, example: "Nike" }
+          additionalProperties: true
+
+    RecommendationContext:
+      type: object
+      description: |
+        Context in which the recommendation is requested.
+        Logged with every response for A/B test attribution.
+      properties:
+        surface:
+          type: string
+          enum: [home_screen, product_detail, cart, search_results]
+          description: UI surface where recommendations will be displayed
+          example: "home_screen"
+        session_id:
+          type: string
+          description: Current session identifier
+          example: "sess-20260607-xyz"
+
+    ErrorResponse:
+      type: object
+      required: [error_code, message, request_id]
+      description: |
+        RFC 7807 Problem Details format.
+        All error responses conform to this schema so clients can implement
+        uniform error handling.
+      properties:
+        error_code:
+          type: string
+          enum:
+            - USER_NOT_FOUND
+            - INVALID_REQUEST
+            - MODEL_UNAVAILABLE
+            - FEATURE_STORE_TIMEOUT
+            - RATE_LIMIT_EXCEEDED
+            - INTERNAL_ERROR
+          example: "FEATURE_STORE_TIMEOUT"
+        message:
+          type: string
+          example: "Feature store lookup timed out after 10ms"
+        request_id:
+          type: string
+          example: "req-a1b2c3d4"
+        details:
+          type: object
+          additionalProperties: true
+          description: Technical details for debugging
+
+  headers:
+    X-Model-Version:
+      description: |
+        Active model version (SemVer). Monitored by the ModelVersionMismatch
+        alert in monitoring/alerts.yaml. Must match the MLflow registry
+        model_version metadata field.
+      schema:
+        type: string
+        example: "1.5.0"
+    X-Request-ID:
+      description: Unique request identifier (UUID v4) for distributed tracing
+      schema:
+        type: string
+        format: uuid
+    X-Experiment-ID:
+      description: A/B experiment bucket ID injected by the gateway splitter
+      schema:
+        type: string
+        example: "exp-reco-v2-10pct"
+    X-Serving-Latency-Ms:
+      description: Model inference + feature lookup duration in milliseconds
+      schema:
+        type: number
+        example: 47.3
+
+  responses:
+    UnauthorizedError:
+      description: JWT missing or invalid
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    RateLimitError:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds until next allowed request
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+paths:
+
+  # ============================================================
+  # PRIMARY SYNC ENDPOINT
+  # p95 ≤ 120 ms SLO is measured on this endpoint.
+  # ============================================================
+  /v1/recommend:
+    post:
+      operationId: getRecommendations
+      summary: Real-time recommendation for a single user
+      description: |
+        Returns a ranked top-K product list based on the user's last 30 days of activity.
+        If the user has no history, a popularity-based fallback is activated and the response
+        includes `cold_start: true`.
+
+        **SLO**: p95 ≤ 120 ms (consistent with `serving/capacity-plan.md` and `serving/slos.yaml`)
+      tags: [Recommendations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id, k]
+              properties:
+                user_id:
+                  type: string
+                  description: User identifier in the retail system
+                  example: "usr-91827364"
+                k:
+                  type: integer
+                  minimum: 1
+                  maximum: 50
+                  default: 10
+                  description: Number of recommendations to return
+                  example: 10
+                context:
+                  $ref: '#/components/schemas/RecommendationContext'
+                exclude_item_ids:
+                  type: array
+                  items: { type: string }
+                  maxItems: 100
+                  description: Items to exclude from results (e.g. already in cart)
+                  example: ["prod-1111", "prod-2222"]
+      responses:
+        "200":
+          description: Recommendations returned successfully
+          headers:
+            X-Model-Version: { $ref: '#/components/headers/X-Model-Version' }
+            X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+            X-Experiment-ID: { $ref: '#/components/headers/X-Experiment-ID' }
+            X-Serving-Latency-Ms: { $ref: '#/components/headers/X-Serving-Latency-Ms' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user_id, recommendations, cold_start, model_version]
+                properties:
+                  user_id: { type: string, example: "usr-91827364" }
+                  recommendations:
+                    type: array
+                    items: { $ref: '#/components/schemas/RecommendationItem' }
+                  cold_start:
+                    type: boolean
+                    description: true = no history found; popularity fallback was used
+                    example: false
+                  model_version:
+                    type: string
+                    description: Same value as X-Model-Version header; included in body for logging
+                    example: "1.5.0"
+                  served_at:
+                    type: string
+                    format: date-time
+                    example: "2026-06-07T14:23:01Z"
+        "400":
+          description: Invalid request (validation error)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "401": { $ref: '#/components/responses/UnauthorizedError' }
+        "429": { $ref: '#/components/responses/RateLimitError' }
+        "503":
+          description: Model or Feature Store temporarily unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  # ============================================================
+  # BATCH ENDPOINT
+  # Use case: marketing campaign personalization, nightly precompute.
+  # SLO: p95 ≤ 2000 ms (different from the sync endpoint).
+  # ============================================================
+  /v1/recommend/batch:
+    post:
+      operationId: getBatchRecommendations
+      summary: Synchronous bulk recommendation for up to 500 users
+      description: |
+        Returns recommendations for multiple users in a single synchronous call.
+
+        **Use case**: email campaign personalization, nightly precompute jobs.
+
+        **SLO**: p95 ≤ 2000 ms (distinct from the sync endpoint SLO).
+
+        For more than 500 users, use the async endpoint.
+      tags: [Recommendations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [requests]
+              properties:
+                requests:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items:
+                    type: object
+                    required: [user_id, k]
+                    properties:
+                      user_id: { type: string }
+                      k: { type: integer, minimum: 1, maximum: 50 }
+                      context: { $ref: '#/components/schemas/RecommendationContext' }
+      responses:
+        "200":
+          description: Batch recommendations returned
+          headers:
+            X-Model-Version: { $ref: '#/components/headers/X-Model-Version' }
+            X-Request-ID: { $ref: '#/components/headers/X-Request-ID' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [results, model_version, processed_count, failed_count]
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        user_id: { type: string }
+                        recommendations:
+                          type: array
+                          items: { $ref: '#/components/schemas/RecommendationItem' }
+                        cold_start: { type: boolean }
+                        error:
+                          type: string
+                          description: Per-user error message if this user failed
+                  model_version: { type: string }
+                  processed_count: { type: integer }
+                  failed_count: { type: integer }
+        "400":
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "401": { $ref: '#/components/responses/UnauthorizedError' }
+        "413":
+          description: More than 500 users — use the async endpoint
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  # ============================================================
+  # ASYNC ENDPOINT
+  # Use case: full-user-base precompute, large A/B segment prep.
+  # Returns immediately with a job_id; results delivered via webhook.
+  # ============================================================
+  /v1/recommend/async:
+    post:
+      operationId: submitAsyncRecommendations
+      summary: Submit a large bulk job (webhook callback on completion)
+      description: |
+        Accepts up to 100,000 user IDs. Returns a `job_id` immediately.
+        When processing is complete, the service POSTs results to `callback_url`.
+
+        **Use case**: daily precompute for all active users, large A/B segment preparation.
+      tags: [Recommendations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_ids, k, callback_url]
+              properties:
+                user_ids:
+                  type: array
+                  minItems: 1
+                  maxItems: 100000
+                  items: { type: string }
+                k: { type: integer, minimum: 1, maximum: 50 }
+                callback_url:
+                  type: string
+                  format: uri
+                  description: URL that receives a POST when the job completes
+                  example: "https://client.company.com/webhooks/recommendations"
+                callback_secret:
+                  type: string
+                  description: |
+                    Shared secret for signing callbacks. The service signs the callback
+                    payload with HMAC-SHA256 and includes the signature in
+                    the `X-Webhook-Signature` header.
+      responses:
+        "202":
+          description: Job accepted and queued for processing
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [job_id, estimated_completion_seconds]
+                properties:
+                  job_id:
+                    type: string
+                    example: "job-20260607-ab12cd"
+                  estimated_completion_seconds:
+                    type: integer
+                    example: 120
+                  status_url:
+                    type: string
+                    format: uri
+                    example: "https://api.company.com/v1/recommend/async/job-20260607-ab12cd"
+        "400":
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "401": { $ref: '#/components/responses/UnauthorizedError' }
+
+  /v1/recommend/async/{job_id}:
+    get:
+      operationId: getAsyncJobStatus
+      summary: Poll the status of an async job
+      tags: [Recommendations]
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id: { type: string }
+                  status:
+                    type: string
+                    enum: [queued, processing, completed, failed]
+                  progress_percent: { type: integer }
+                  result_url: { type: string, format: uri }
+
+  # ============================================================
+  # HEALTH — Kubernetes liveness and readiness probe target
+  # ============================================================
+  /health:
+    get:
+      operationId: healthCheck
+      summary: Service health check
+      description: |
+        Returns 200 only when the model is loaded and the Feature Store is reachable.
+        Kubernetes readiness probe uses this endpoint; a 503 response prevents the pod
+        from receiving traffic.
+      tags: [Operations]
+      security: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok] }
+                  model_version: { type: string, example: "1.5.0" }
+                  feature_store_connected: { type: boolean }
+                  faiss_index_loaded: { type: boolean }
+                  uptime_seconds: { type: integer }
+        "503":
+          description: Service not ready
+
+  /metrics:
+    get:
+      operationId: prometheusMetrics
+      summary: Prometheus metrics scrape endpoint
+      description: Scraped by the Kubernetes ServiceMonitor. Exposes all Prometheus metrics.
+      tags: [Operations]
+      security: []
+      responses:
+        "200":
+          content:
+            text/plain:
+              schema:
+                type: string
+
+tags:
+  - name: Recommendations
+    description: Recommendation endpoints
+  - name: Operations
+    description: Health checks and monitoring

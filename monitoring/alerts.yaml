@@ -1,0 +1,300 @@
+# Prometheus Alerting Rules — Recommendation Service
+#
+# CONSISTENCY CONTRACT:
+# Every threshold in this file must match its counterpart in:
+#   serving/slos.yaml   — SLO objectives and burn rates
+#   runbooks/rollback.md — trigger thresholds for manual rollback
+#   api/openapi.yaml     — X-Model-Version header (ModelVersionMismatch alert)
+
+groups:
+
+# ================================================================
+# GROUP 1: AVAILABILITY BURN-RATE ALERTS
+# SLO: 99.9 % availability (slos.yaml: availability objective)
+# Error budget: 43.8 min / 30 days
+# ================================================================
+  - name: recommendation.availability.burnrate
+    rules:
+
+      # Fast window — 5 minutes
+      # Burn rate 14.4× means 5 % of the monthly error budget is consumed in 1 hour.
+      # Formula: burn_rate × error_rate_budget = 14.4 × 0.001 = 0.0144 (1.44 % error rate)
+      # Severity: CRITICAL — page on-call immediately.
+      # Matches slos.yaml alerting.burn_rate_fast: 14.4
+      - alert: AvailabilityBudgetBurnFast
+        expr: |
+          (
+            sum(rate(http_requests_total{
+              service="recommendation-service",
+              status_code=~"5.."
+            }[5m]))
+            /
+            sum(rate(http_requests_total{
+              service="recommendation-service"
+            }[5m]))
+          ) > (14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: critical
+          team: ml-platform
+          service: recommendation-service
+          slo: availability
+        annotations:
+          summary: "Availability SLO — fast error budget burn"
+          description: |
+            5-minute error rate is {{ $value | humanizePercentage }}, burning the
+            availability error budget at 14.4×. Immediate action required.
+            Follow: runbooks/rollback.md
+            Trigger thresholds in rollback.md: error rate > 1.44 % for 2 min.
+          runbook_url: "https://wiki.company.com/runbooks/recommendation-rollback"
+          dashboard: "https://grafana.internal/d/rec-slo"
+
+      # Slow window — 30 minutes
+      # Burn rate 6× means the monthly budget is exhausted in ~5 days.
+      # Severity: WARNING — investigate before next business day.
+      # Matches slos.yaml alerting.burn_rate_slow: 6.0
+      - alert: AvailabilityBudgetBurnSlow
+        expr: |
+          (
+            sum(rate(http_requests_total{
+              service="recommendation-service",
+              status_code=~"5.."
+            }[30m]))
+            /
+            sum(rate(http_requests_total{
+              service="recommendation-service"
+            }[30m]))
+          ) > (6.0 * 0.001)
+        for: 15m
+        labels:
+          severity: warning
+          team: ml-platform
+          service: recommendation-service
+          slo: availability
+        annotations:
+          summary: "Availability SLO — sustained error budget burn"
+          description: |
+            30-minute error rate is {{ $value | humanizePercentage }}, burning the
+            availability error budget at 6×. Investigate before error budget is exhausted.
+
+# ================================================================
+# GROUP 2: LATENCY BURN-RATE ALERTS
+# SLO: 99.5 % of requests complete in ≤ 120 ms (slos.yaml: sync_endpoint_p95_latency)
+# Error budget: 216 min / 30 days
+# ================================================================
+  - name: recommendation.latency.burnrate
+    rules:
+
+      # Fast window — 5 minutes
+      # Error = any request that takes > 120 ms.
+      # Error rate budget = 1 - 0.995 = 0.005 (0.5 %).
+      # Threshold: 14.4 × 0.005 = 0.072 (7.2 % of requests exceed 120 ms).
+      - alert: LatencyBudgetBurnFast
+        expr: |
+          (
+            1 - (
+              sum(rate(http_request_duration_ms_bucket{
+                service="recommendation-service",
+                endpoint="/v1/recommend",
+                le="120"
+              }[5m]))
+              /
+              sum(rate(http_request_duration_ms_count{
+                service="recommendation-service",
+                endpoint="/v1/recommend"
+              }[5m]))
+            )
+          ) > (14.4 * 0.005)
+        for: 2m
+        labels:
+          severity: critical
+          team: ml-platform
+          slo: latency_p95
+        annotations:
+          summary: "Latency SLO — fast error budget burn"
+          description: |
+            {{ $value | humanizePercentage }} of requests exceed the 120 ms p95 threshold.
+            Latency error budget burning at 14.4×. Check pod CPU and Feature Store latency.
+          runbook_url: "https://wiki.company.com/runbooks/recommendation-rollback"
+
+      # Slow window — 30 minutes
+      # Threshold: 6.0 × 0.005 = 0.03 (3 % of requests exceed 120 ms).
+      - alert: LatencyBudgetBurnSlow
+        expr: |
+          (
+            1 - (
+              sum(rate(http_request_duration_ms_bucket{
+                service="recommendation-service",
+                endpoint="/v1/recommend",
+                le="120"
+              }[30m]))
+              /
+              sum(rate(http_request_duration_ms_count{
+                service="recommendation-service",
+                endpoint="/v1/recommend"
+              }[30m]))
+            )
+          ) > (6.0 * 0.005)
+        for: 15m
+        labels:
+          severity: warning
+          team: ml-platform
+          slo: latency_p95
+        annotations:
+          summary: "Latency SLO — sustained error budget burn"
+          description: |
+            {{ $value | humanizePercentage }} of requests exceed 120 ms (30-minute window).
+            Latency error budget burning at 6×.
+
+# ================================================================
+# GROUP 3: MODEL VERSION MISMATCH
+# Detects rolling deploy anomalies and unauthorized image tags.
+# Tied to X-Model-Version header in api/openapi.yaml.
+# ================================================================
+  - name: recommendation.model.version
+    rules:
+
+      # Multiple model versions running simultaneously for more than 10 minutes.
+      # Normal during a rolling deploy (expected duration < 5 min).
+      # If still present after 10 min, the rollout is stuck.
+      - alert: ModelVersionMismatch
+        expr: |
+          count(
+            count by (model_version) (
+              recommendation_model_version_info{service="recommendation-service"}
+            )
+          ) > 1
+        for: 10m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "Multiple model versions active in production"
+          description: |
+            {{ $value }} distinct model versions are running simultaneously.
+            Rolling deploy has been in progress for > 10 minutes.
+            Check: cicd/.github/workflows/deploy-model.yml deploy-production job.
+            X-Model-Version header (api/openapi.yaml) reports the per-pod version.
+
+      # A pod is running an image whose tag does not match the expected format.
+      # Format: v<semver>-git-<7-char-sha> (from lifecycle/model-registry.yaml image_tag_format)
+      - alert: UnexpectedModelVersion
+        expr: |
+          recommendation_model_version_info{
+            service="recommendation-service",
+            model_version!~"^[0-9]+\\.[0-9]+\\.[0-9]+-git-[a-f0-9]{7}$"
+          } == 1
+        for: 1m
+        labels:
+          severity: critical
+          team: ml-platform
+        annotations:
+          summary: "Unexpected model version format detected"
+          description: |
+            Pod is running model version {{ $labels.model_version }}, which does not
+            match the expected format v<semver>-git-<sha>.
+            This may indicate a manually pushed image bypassing the CI/CD pipeline.
+
+# ================================================================
+# GROUP 4: FEATURE STORE
+# SLO: ≥ 95 % Feature Store hit rate (slos.yaml: feature_store_hit_rate)
+# Threshold matches lifecycle/model-registry.yaml canary_feature_miss_rate gate (≤ 5 %).
+# ================================================================
+  - name: recommendation.feature_store
+    rules:
+
+      - alert: FeatureStoreMissRateHigh
+        expr: |
+          (
+            sum(rate(feature_store_miss_total{service="recommendation-service"}[5m]))
+            /
+            sum(rate(feature_store_lookups_total{service="recommendation-service"}[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          team: data-engineering
+        annotations:
+          summary: "Feature Store miss rate above 5 %"
+          description: |
+            Feature Store miss rate is {{ $value | humanizePercentage }}.
+            Probable cause: offline data pipeline is delayed.
+            Check the last pipeline run in the data-engineering Slack channel.
+            This alert also fires the canary gate defined in lifecycle/model-registry.yaml.
+
+      - alert: FeatureStoreDown
+        expr: |
+          up{job="redis-feature-store"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "Feature Store (Redis) unreachable"
+          description: |
+            Redis feature store is not responding. All non-cold-start recommendations
+            are degraded to popularity fallback. Consider rollback per runbooks/rollback.md.
+
+# ================================================================
+# GROUP 5: MODEL DRIFT (EvidentlyAI integration)
+# Drift signals feed into the retraining trigger in lifecycle/lifecycle.md.
+# ================================================================
+  - name: recommendation.drift
+    rules:
+
+      - alert: FeatureDistributionDrift
+        expr: |
+          feature_drift_psi{service="recommendation-service"} > 0.2
+        # PSI (Population Stability Index) > 0.2 = significant distribution shift.
+        # This threshold triggers the "retrain trigger" in lifecycle/lifecycle.md.
+        for: 30m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "Feature distribution drift detected"
+          description: |
+            Feature {{ $labels.feature_name }} has PSI={{ $value }}, exceeding the 0.2
+            drift threshold. The model may need retraining. See lifecycle/lifecycle.md
+            drift alert → retrain trigger flow.
+
+      - alert: PredictionScoreDistributionDrift
+        expr: |
+          prediction_score_drift_ks_statistic{service="recommendation-service"} > 0.1
+        # KS statistic > 0.1 = model score distribution has shifted vs baseline.
+        # Early signal that model quality is degrading before offline metrics catch it.
+        for: 1h
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "Recommendation score distribution drift"
+          description: |
+            Score distribution KS statistic is {{ $value }} (threshold 0.1).
+            Scores are shifting from the baseline distribution recorded at model promotion.
+            ML Lead should review model performance metrics.
+
+# ================================================================
+# GROUP 6: COLD-START COVERAGE
+# SLO: 99.9 % cold-start requests return a non-error response (slos.yaml: cold_start_coverage).
+# ================================================================
+  - name: recommendation.cold_start
+    rules:
+
+      - alert: ColdStartFailureRateHigh
+        expr: |
+          (
+            sum(rate(recommendation_cold_start_errors_total[5m]))
+            /
+            sum(rate(recommendation_cold_start_requests_total[5m]))
+          ) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "Cold-start failure rate above 1 %"
+          description: |
+            {{ $value | humanizePercentage }} of cold-start requests are failing.
+            Likely cause: popularity cache (Redis) is unavailable or stale.
+            Check the hourly popularity refresh job.

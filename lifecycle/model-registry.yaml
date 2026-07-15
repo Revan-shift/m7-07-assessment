@@ -1,0 +1,190 @@
+# Model Registry Specification
+# Defines the mandatory metadata fields, stage transition rules,
+# and lineage requirements for the recommendation model.
+# The CI/CD pipeline validates against this schema before any promotion.
+
+registry:
+  backend: mlflow
+  artifact_store: s3://mlops-artifacts/recommendation/
+  ui_url: https://mlflow.internal.company.com
+
+model_name: retail-recommendation-two-tower
+
+# ---------------------------------------------------------------
+# VERSIONING SCHEME
+# MAJOR: architecture change (new layer, different embedding dim)
+# MINOR: new training dataset, new feature added
+# PATCH: hyperparameter tuning, bug fix
+# ---------------------------------------------------------------
+versioning:
+  scheme: semver                        # v1.0.0, v1.1.0 ...
+  image_tag_format: "v{version}-git-{git_commit_sha}"
+  # NOTE: image_tag_format must match container/Dockerfile ARG usage
+  # and cicd/.github/workflows/deploy-model.yml tag construction.
+
+# ---------------------------------------------------------------
+# STAGES AND TRANSITION RULES
+# Flow: None → Staging → Production → Archived
+# Each transition has its own required gates.
+# ---------------------------------------------------------------
+stages:
+  staging:
+    description: "Offline metrics passed; ready for online validation"
+    required_gates:
+      - name: offline_ndcg
+        threshold: "NDCG@10 >= 0.42"
+        automated: true
+        fail_action: block_registration
+      - name: offline_hit_rate
+        threshold: "HR@10 >= 0.35"
+        automated: true
+        fail_action: block_registration
+      - name: catalog_coverage
+        threshold: "Coverage@1000 >= 0.60"
+        automated: true
+        fail_action: block_registration
+      - name: cold_start_hit_rate
+        threshold: "ColdStart_HR@10 >= 0.20"
+        automated: true
+        fail_action: block_registration
+      - name: no_training_data_leakage
+        description: "Test set does not overlap with training set"
+        automated: true
+        fail_action: block_registration
+
+  production:
+    description: "Online validation passed; awaiting human sign-off"
+    required_gates:
+      - name: canary_p95_latency
+        threshold: "p95_latency_ms <= 120"
+        automated: true
+        measurement_window: "30m"
+        traffic_percent: 10
+        fail_action: block_promotion
+        # Threshold matches slos.yaml sync_endpoint_p95_latency objective
+      - name: canary_error_rate
+        threshold: "error_rate <= 0.001"         # 0.1 %
+        automated: true
+        measurement_window: "30m"
+        fail_action: block_promotion
+        # Threshold matches slos.yaml availability objective (1 - 0.999)
+      - name: canary_feature_miss_rate
+        threshold: "feature_miss_rate <= 0.05"   # 5 %
+        automated: true
+        measurement_window: "30m"
+        fail_action: block_promotion
+        # Threshold matches slos.yaml feature_store_hit_rate objective
+      - name: human_approval
+        approvers:
+          - role: ml_lead
+          - role: ml_platform_engineer    # backup approver
+        timeout_hours: 48
+        fail_action: block_promotion
+        # No automated override exists for this gate.
+
+  archived:
+    description: "Retired from active serving"
+    trigger:
+      - condition: "days_since_last_traffic >= 90"
+        automated: true
+      - condition: "manual_archive_request"
+        automated: false
+
+# ---------------------------------------------------------------
+# REQUIRED METADATA
+# All fields below are mandatory before a model can enter Staging.
+# The registry API rejects registration if any field is missing.
+# ---------------------------------------------------------------
+required_metadata:
+  - field: training_dataset_version
+    type: string
+    example: "ds-2026-05-25-v3"
+    description: "Which dataset version was used for training"
+
+  - field: training_dataset_uri
+    type: string
+    example: "s3://data-lake/recommendations/training/2026-05-25/"
+    description: "S3 path to the training dataset — data lineage"
+
+  - field: feature_schema_version
+    type: string
+    example: "feat-schema-v4"
+    description: "Version of the Feature Store schema used"
+    # NOTE: Must match the schema version produced by the offline feature pipeline
+
+  - field: training_job_id
+    type: string
+    example: "sagemaker-job-20260525-143022"
+    description: "Training job ID for reproducibility"
+
+  - field: git_commit_sha
+    type: string
+    example: "a3f9c12"
+    description: "Git SHA of the training code that produced this model"
+
+  - field: model_architecture
+    type: string
+    enum: [two-tower-v1, two-tower-v2]
+    description: "Architecture type — must match the serving code expectation"
+
+  - field: embedding_dim
+    type: integer
+    example: 128
+    description: "Embedding dimensionality — FAISS index must be built with this value"
+
+  - field: faiss_index_uri
+    type: string
+    example: "s3://mlops-artifacts/recommendation/v1.5.0/faiss_index.bin"
+    description: "Location of the pre-computed FAISS index — baked into the image"
+
+  - field: model_size_mb
+    type: float
+    example: 387.4
+    description: "Total artifact size; used to verify image size budget (≤ 700 MB)"
+
+# ---------------------------------------------------------------
+# TRACKED METRICS (stored at registration time)
+# ---------------------------------------------------------------
+tracked_metrics:
+  - ndcg_at_10
+  - hit_rate_at_10
+  - coverage_at_1000
+  - cold_start_hit_rate_at_10
+  - mrr                                  # Mean Reciprocal Rank
+  - training_time_seconds
+  - evaluation_time_seconds
+
+# ---------------------------------------------------------------
+# CI/CD INTEGRATION
+# This section must remain consistent with cicd/deploy-model.yml.
+# ---------------------------------------------------------------
+cicd_integration:
+  promotion_webhook: https://mlflow.internal/webhooks/promote
+  image_registry: 123456789.dkr.ecr.eu-west-1.amazonaws.com/recommendation-service
+  image_tag_format: "v{version}-git-{git_commit_sha}"
+
+# ---------------------------------------------------------------
+# REGISTRATION EXAMPLE (Python MLflow client)
+# ---------------------------------------------------------------
+# import mlflow, os
+# with mlflow.start_run():
+#     mlflow.log_params({...})
+#     mlflow.log_metrics({
+#         "ndcg_at_10": 0.451,
+#         "hit_rate_at_10": 0.382,
+#         "coverage_at_1000": 0.634,
+#         "cold_start_hit_rate_at_10": 0.231,
+#     })
+#     mlflow.log_artifact("faiss_index.bin")
+#     mlflow.set_tags({
+#         "training_dataset_version": "ds-2026-05-25-v3",
+#         "git_commit_sha": os.environ["GIT_SHA"],
+#         "model_architecture": "two-tower-v1",
+#         "embedding_dim": "128",
+#         "faiss_index_uri": "s3://mlops-artifacts/...",
+#         "model_size_mb": "387.4",
+#     })
+#     mlflow.register_model(
+#         f"runs:/{run_id}/model",
+#         "retail-recommendation-two-tower"
+#     )

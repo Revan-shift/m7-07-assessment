@@ -1,0 +1,24 @@
+{
+  "description": "503 — Feature Store timeout error",
+  "note": "error_code enum matches the FeatureStoreMissRateHigh alert in monitoring/alerts.yaml",
+  "response": {
+    "status": 503,
+    "headers": {
+      "X-Request-ID": "req-deadbeef-1234-5678-abcd-ef0987654321",
+      "X-Model-Version": "1.5.0",
+      "Retry-After": "2",
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "error_code": "FEATURE_STORE_TIMEOUT",
+      "message": "Feature store lookup timed out after 10ms. Cold-start fallback also unavailable.",
+      "request_id": "req-deadbeef-1234-5678-abcd-ef0987654321",
+      "details": {
+        "feature_store_host": "redis-cluster.internal:6379",
+        "timeout_ms": 10,
+        "attempted_fallback": true,
+        "fallback_available": false
+      }
+    }
+  }
+}

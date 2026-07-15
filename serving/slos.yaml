@@ -1,0 +1,177 @@
+# SLO Specification — Recommendation Service
+# Every numeric threshold in this file must be consistent with
+# serving/capacity-plan.md and monitoring/alerts.yaml.
+# Changing a value here requires updating all three files.
+
+service: retail-recommendation-service
+team: ml-platform
+owner: ml-platform@company.com
+review_schedule: quarterly
+
+slos:
+
+  # ---------------------------------------------------------------
+  # LATENCY SLO — primary serving endpoint
+  # Objective: 99.5 % of requests to POST /v1/recommend complete in ≤ 120 ms.
+  # Consistent with capacity-plan.md "p95 latency budget: 120 ms".
+  # ---------------------------------------------------------------
+  - name: sync_endpoint_p95_latency
+    description: |
+      p95 latency for POST /v1/recommend.
+      When this SLO burns, monitoring/alerts.yaml LatencyBudgetBurnFast fires.
+    metric:
+      type: histogram_quantile
+      query: |
+        histogram_quantile(0.95,
+          sum(rate(http_request_duration_ms_bucket{
+            service="recommendation-service",
+            endpoint="/v1/recommend",
+            method="POST"
+          }[5m])) by (le)
+        )
+    objective: 120           # milliseconds
+    window: 30d
+    error_budget_minutes: 216
+    # 30d × 1440 min/d × (1 - 0.995) = 216 min of allowed latency violations
+    alerting:
+      burn_rate_fast:
+        rate: 14.4
+        window: 5m
+        for: 2m
+        severity: critical
+      burn_rate_slow:
+        rate: 6.0
+        window: 30m
+        for: 15m
+        severity: warning
+
+  - name: sync_endpoint_p99_latency
+    description: |
+      p99 latency target — informational only; no alert fires on breach.
+      Used for capacity headroom monitoring.
+    metric:
+      query: |
+        histogram_quantile(0.99,
+          sum(rate(http_request_duration_ms_bucket{
+            service="recommendation-service",
+            endpoint="/v1/recommend"
+          }[5m])) by (le)
+        )
+    objective: 200           # milliseconds
+    window: 30d
+    informational_only: true
+
+  # ---------------------------------------------------------------
+  # AVAILABILITY SLO
+  # Objective: 99.9 % of requests return a non-5xx response.
+  # Error budget: 43.8 minutes per 30-day window.
+  # ---------------------------------------------------------------
+  - name: availability
+    description: |
+      Successful request ratio (non-5xx).
+      Consistent with capacity-plan.md target RPS and hardware sizing.
+      When this SLO burns, monitoring/alerts.yaml AvailabilityBudgetBurnFast fires.
+    metric:
+      type: ratio
+      query: |
+        1 - (
+          sum(rate(http_requests_total{
+            service="recommendation-service",
+            status_code=~"5.."
+          }[5m]))
+          /
+          sum(rate(http_requests_total{
+            service="recommendation-service"
+          }[5m]))
+        )
+    objective: 0.999         # 99.9 %
+    window: 30d
+    error_budget_minutes: 43.8
+    alerting:
+      burn_rate_fast:
+        rate: 14.4
+        window: 5m
+        for: 2m
+        severity: critical
+      burn_rate_slow:
+        rate: 6.0
+        window: 30m
+        for: 15m
+        severity: warning
+
+  # ---------------------------------------------------------------
+  # COLD-START COVERAGE SLO
+  # Objective: cold-start users always receive a response.
+  # ---------------------------------------------------------------
+  - name: cold_start_coverage
+    description: |
+      Fraction of cold-start requests that return a non-error response.
+      A cold-start error means the Redis popularity cache is unavailable.
+      Consistent with lifecycle/lifecycle.md cold-start fallback design.
+    metric:
+      query: |
+        1 - (
+          sum(rate(recommendation_cold_start_errors_total[5m]))
+          /
+          sum(rate(recommendation_cold_start_requests_total[5m]))
+        )
+    objective: 0.999
+    window: 30d
+    alerting:
+      burn_rate_fast:
+        rate: 14.4
+        window: 5m
+        for: 5m
+        severity: warning
+
+  # ---------------------------------------------------------------
+  # FEATURE STORE HIT RATE SLO
+  # Objective: ≥ 95 % of Feature Store lookups succeed.
+  # ---------------------------------------------------------------
+  - name: feature_store_hit_rate
+    description: |
+      Fraction of Redis lookups that return a valid feature vector.
+      A miss rate above 5 % indicates either a pipeline delay or a
+      user-ID mismatch between the app and the feature store.
+      Consistent with lifecycle/model-registry.yaml canary_feature_miss_rate gate (≤ 5 %).
+    metric:
+      query: |
+        1 - (
+          sum(rate(feature_store_miss_total{service="recommendation-service"}[5m]))
+          /
+          sum(rate(feature_store_lookups_total{service="recommendation-service"}[5m]))
+        )
+    objective: 0.95          # 95 % hit rate
+    window: 30d
+    informational_only: false
+
+# ---------------------------------------------------------------
+# ERROR BUDGET POLICY
+# What actions are taken as the error budget is consumed.
+# ---------------------------------------------------------------
+error_budget_policy:
+
+  - when: "burn_rate > 14.4 sustained for 5 minutes"
+    action: page_on_call
+    description: >
+      Fast burn — immediate intervention required.
+      On-call engineer follows runbooks/rollback.md.
+
+  - when: "budget_remaining < 50%"
+    action: halt_new_experiments
+    description: >
+      No new A/B experiments may be started.
+      Existing experiments continue.
+      Half the budget is consumed; no new risk should be introduced.
+
+  - when: "budget_remaining < 10%"
+    action: freeze_all_deployments
+    description: >
+      No new deployments — rollback and hotfix only.
+      Decision requires ML Lead and Engineering Manager sign-off.
+
+  - when: "budget_exhausted"
+    action: incident_review_required
+    description: >
+      Post-mortem must be completed within 5 business days.
+      Next deployment is blocked until the review is closed.

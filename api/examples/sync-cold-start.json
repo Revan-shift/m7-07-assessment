@@ -1,0 +1,57 @@
+{
+  "description": "POST /v1/recommend — Cold-start user (no purchase or browsing history)",
+  "note": "cold_start:true means the popularity-based fallback cache was used instead of the model",
+  "request": {
+    "url": "https://api.company.com/v1/recommend",
+    "method": "POST",
+    "headers": {
+      "Authorization": "Bearer eyJhbGciOiJSUzI1NiJ9...",
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "user_id": "usr-new-00000001",
+      "k": 10,
+      "context": {
+        "surface": "home_screen",
+        "session_id": "sess-20260607-new001"
+      }
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "X-Model-Version": "1.5.0",
+      "X-Request-ID": "req-b9c8d7e6-f5a4-3b21-9876-543210fedcba",
+      "X-Serving-Latency-Ms": "12.1",
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "user_id": "usr-new-00000001",
+      "cold_start": true,
+      "model_version": "1.5.0",
+      "served_at": "2026-06-07T14:24:15Z",
+      "recommendations": [
+        {
+          "item_id": "prod-TOP-001-bestseller",
+          "score": 0.950,
+          "rank": 1,
+          "metadata": {
+            "category": "footwear",
+            "brand": "Nike",
+            "popularity_rank": 1
+          }
+        },
+        {
+          "item_id": "prod-TOP-002-trending",
+          "score": 0.940,
+          "rank": 2,
+          "metadata": {
+            "category": "apparel",
+            "brand": "Zara",
+            "popularity_rank": 2
+          }
+        }
+      ]
+    }
+  }
+}

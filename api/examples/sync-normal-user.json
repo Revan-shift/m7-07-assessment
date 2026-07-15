@@ -1,0 +1,57 @@
+{
+  "description": "POST /v1/recommend — Normal user with purchase history",
+  "request": {
+    "url": "https://api.company.com/v1/recommend",
+    "method": "POST",
+    "headers": {
+      "Authorization": "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...",
+      "Content-Type": "application/json",
+      "X-Request-ID": "req-a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+    },
+    "body": {
+      "user_id": "usr-91827364",
+      "k": 10,
+      "context": {
+        "surface": "home_screen",
+        "session_id": "sess-20260607-xyz789"
+      },
+      "exclude_item_ids": ["prod-1111", "prod-2222"]
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "X-Model-Version": "1.5.0",
+      "X-Request-ID": "req-a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "X-Experiment-ID": "exp-reco-v2-10pct",
+      "X-Serving-Latency-Ms": "47.3",
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "user_id": "usr-91827364",
+      "cold_start": false,
+      "model_version": "1.5.0",
+      "served_at": "2026-06-07T14:23:01Z",
+      "recommendations": [
+        {
+          "item_id": "prod-8821-sneakers-blue",
+          "score": 0.912,
+          "rank": 1,
+          "metadata": { "category": "footwear", "brand": "Nike" }
+        },
+        {
+          "item_id": "prod-4432-tshirt-white",
+          "score": 0.887,
+          "rank": 2,
+          "metadata": { "category": "apparel", "brand": "Adidas" }
+        },
+        {
+          "item_id": "prod-9910-cap-black",
+          "score": 0.843,
+          "rank": 3,
+          "metadata": { "category": "accessories", "brand": "Nike" }
+        }
+      ]
+    }
+  }
+}

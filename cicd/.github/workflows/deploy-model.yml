@@ -1,0 +1,381 @@
+name: Deploy Recommendation Model
+
+# ---------------------------------------------------------------
+# WHEN DOES THIS PIPELINE RUN?
+# 1. MLflow registry promotes a model to "Production" (webhook trigger).
+#    Webhook URL is defined in lifecycle/model-registry.yaml (cicd_integration.promotion_webhook).
+# 2. A commit lands on main that changes serving code, dependencies, or the Dockerfile.
+# 3. Manual dispatch — for emergency rollouts or testing.
+# ---------------------------------------------------------------
+on:
+  repository_dispatch:
+    types: [model-promoted-to-production]   # fired by MLflow webhook
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'requirements.txt'
+      - 'container/Dockerfile'
+  workflow_dispatch:
+    inputs:
+      model_version:
+        description: 'MLflow model version (e.g. v1.5.0)'
+        required: true
+      force_full_rollout:
+        description: 'Skip canary and deploy directly to 100 %?'
+        type: boolean
+        default: false
+
+env:
+  ECR_REGISTRY: 123456789.dkr.ecr.eu-west-1.amazonaws.com
+  ECR_REPOSITORY: recommendation-service
+  # IMAGE_TAG format must match lifecycle/model-registry.yaml image_tag_format:
+  # "v{version}-git-{git_commit_sha}"
+  IMAGE_TAG: ${{ github.event.client_payload.model_version || github.sha }}
+
+# ---------------------------------------------------------------
+# JOB DEPENDENCY CHAIN:
+# lint-and-test → security-scan → build-and-push
+#   → deploy-staging → integration-test
+#   → deploy-canary → await-canary-health
+#   → deploy-production → verify-production
+#
+# Every gate must pass before the next job starts.
+# A failure at any gate stops the pipeline and triggers a Slack alert.
+# ---------------------------------------------------------------
+jobs:
+
+  # ==============================================================
+  # JOB 1: Lint + Unit Tests
+  # Gate: code quality baseline. Nothing is built if this fails.
+  # ==============================================================
+  lint-and-test:
+    name: Lint & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Ruff lint + format check
+        run: ruff check src/ && ruff format --check src/
+
+      - name: MyPy type check
+        run: mypy src/ --strict
+
+      - name: Unit tests with coverage
+        run: |
+          pytest tests/unit/ \
+            --cov=src \
+            --cov-report=xml \
+            --cov-fail-under=85 \
+            -v
+        # Pipeline fails if coverage falls below 85 %.
+
+      - name: OpenAPI lint (Spectral)
+        run: |
+          npm install -g @stoplight/spectral-cli
+          spectral lint api/openapi.yaml --ruleset .spectral.yml
+        # Verifies api/openapi.yaml is lint-clean per the OpenAPI 3.1 ruleset.
+
+  # ==============================================================
+  # JOB 2: Security Scan
+  # Gate: no CRITICAL or HIGH CVEs allowed in dependencies or Dockerfile.
+  # Runs in parallel with (but depends on) lint-and-test.
+  # ==============================================================
+  security-scan:
+    name: Security Scan
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Hadolint — Dockerfile best-practice check
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: container/Dockerfile
+          failure-threshold: warning
+
+      - name: Trivy — dependency CVE scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+        # CRITICAL or HIGH findings fail the build.
+        # Consistent with container/README.md security scanning section.
+
+      - name: pip-audit — Python dependency audit
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt --fail-on-finding
+
+  # ==============================================================
+  # JOB 3: Build Docker Image + Push to ECR
+  # Gate: image size must not exceed 700 MB (container/README.md limit).
+  # Model artifact is baked into the image (ADR-0002).
+  # ==============================================================
+  build-and-push:
+    name: Build & Push Image
+    needs: [lint-and-test, security-scan]
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
+      model_version: ${{ steps.meta.outputs.model_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve model version
+        id: meta
+        run: |
+          MODEL_VERSION="${{ github.event.client_payload.model_version || env.IMAGE_TAG }}"
+          echo "model_version=${MODEL_VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Download model artifact from S3 (bake-in per ADR-0002)
+        run: |
+          # faiss_index_uri and artifact path come from lifecycle/model-registry.yaml
+          aws s3 cp \
+            s3://mlops-artifacts/recommendation/${{ steps.meta.outputs.model_version }}/ \
+            container/model/ \
+            --recursive
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: build
+        run: |
+          MODEL_VER="${{ steps.meta.outputs.model_version }}"
+          GIT_SHA="${{ github.sha }}"
+          # Tag format matches lifecycle/model-registry.yaml image_tag_format
+          TAG="${MODEL_VER}-git-${GIT_SHA:0:7}"
+
+          docker build \
+            --build-arg MODEL_VERSION=${MODEL_VER} \
+            --build-arg GIT_SHA=${GIT_SHA} \
+            --file container/Dockerfile \
+            --tag ${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG} \
+            --tag ${ECR_REGISTRY}/${ECR_REPOSITORY}:${MODEL_VER} \
+            .
+
+          docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}
+          docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${MODEL_VER}
+
+          echo "image_uri=${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Enforce image size limit (≤ 700 MB)
+        run: |
+          SIZE=$(docker image inspect \
+            ${ECR_REGISTRY}/${ECR_REPOSITORY}:${{ steps.meta.outputs.model_version }} \
+            --format='{{.Size}}')
+          SIZE_MB=$((SIZE / 1024 / 1024))
+          echo "Image size: ${SIZE_MB} MB"
+          if [ $SIZE_MB -gt 700 ]; then
+            echo "❌ Image exceeds 700 MB limit: ${SIZE_MB} MB"
+            exit 1
+          fi
+        # 700 MB limit defined in container/README.md image size estimate.
+
+      - name: Trivy — final image CVE scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.build.outputs.image_uri }}
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+
+  # ==============================================================
+  # JOB 4: Staging Deploy + Integration Tests
+  # Gate: end-to-end smoke tests against the staging environment.
+  # ==============================================================
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://api.staging.company.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Roll out to staging
+        run: |
+          kubectl set image deployment/recommendation-service-staging \
+            app=${{ needs.build-and-push.outputs.image_uri }} \
+            --namespace recommendation-staging
+          kubectl rollout status deployment/recommendation-service-staging \
+            --namespace recommendation-staging \
+            --timeout=120s
+
+      - name: Integration tests
+        run: |
+          # Health check
+          curl -f https://api.staging.company.com/health | jq .
+
+          # Warm user → recommendations returned
+          RESP=$(curl -s -X POST https://api.staging.company.com/v1/recommend \
+            -H "Authorization: Bearer ${{ secrets.STAGING_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"user_id":"usr-test-001","k":5}')
+          echo "$RESP" | jq -e '.recommendations | length > 0'
+
+          # Cold-start user → cold_start flag set
+          RESP=$(curl -s -X POST https://api.staging.company.com/v1/recommend \
+            -H "Authorization: Bearer ${{ secrets.STAGING_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"user_id":"usr-brand-new-9999999","k":5}')
+          echo "$RESP" | jq -e '.cold_start == true'
+
+          # X-Model-Version header must be present (cross-checked by ModelVersionMismatch alert)
+          curl -s -I -X POST https://api.staging.company.com/v1/recommend \
+            -H "Authorization: Bearer ${{ secrets.STAGING_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"user_id":"usr-test-001","k":5}' \
+            | grep -i "x-model-version"
+
+  # ==============================================================
+  # JOB 5: Canary Deploy — 10 % production traffic
+  # Gate: 30-minute burn-rate window with automatic rollback on failure.
+  # Skipped if force_full_rollout is true.
+  # ==============================================================
+  deploy-canary:
+    name: Deploy Canary (10 % traffic)
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment:
+      name: production-canary
+    if: ${{ github.event.inputs.force_full_rollout != 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy canary image
+        run: |
+          kubectl set image deployment/recommendation-service-canary \
+            app=${{ needs.build-and-push.outputs.image_uri }} \
+            --namespace recommendation-prod
+          kubectl rollout status deployment/recommendation-service-canary \
+            --namespace recommendation-prod \
+            --timeout=120s
+
+      - name: Route 10 % traffic to canary
+        run: |
+          kubectl patch virtualservice recommendation-vs \
+            --namespace recommendation-prod \
+            --type=merge \
+            -p '{"spec":{"http":[
+              {"match":[{"headers":{"canary":{"exact":"true"}}}],
+               "route":[{"destination":{"host":"recommendation-canary"}}]},
+              {"route":[
+                {"destination":{"host":"recommendation-stable"},"weight":90},
+                {"destination":{"host":"recommendation-canary"},"weight":10}
+              ]}
+            ]}}'
+
+      - name: Monitor canary for 30 minutes
+        run: |
+          echo "Monitoring canary for 30 minutes..."
+          # 30 minutes = 6 alert evaluation cycles (alerts use 5-minute windows)
+          # This matches lifecycle/lifecycle.md "monitor 30 min" canary phase.
+          for i in $(seq 1 30); do
+            sleep 60
+
+            P95=$(curl -s "http://prometheus:9090/api/v1/query" \
+              --data-urlencode \
+              'query=histogram_quantile(0.95,rate(http_request_duration_ms_bucket{deployment="recommendation-canary"}[5m]))' \
+              | jq -r '.data.result[0].value[1] // "0"')
+
+            ERROR_RATE=$(curl -s "http://prometheus:9090/api/v1/query" \
+              --data-urlencode \
+              'query=rate(http_requests_total{deployment="recommendation-canary",status_code=~"5.."}[5m])/rate(http_requests_total{deployment="recommendation-canary"}[5m])' \
+              | jq -r '.data.result[0].value[1] // "0"')
+
+            echo "Minute ${i}: p95=${P95}ms  error_rate=${ERROR_RATE}"
+
+            # Thresholds mirror slos.yaml objectives exactly.
+            if (( $(echo "$P95 > 120" | bc -l) )); then
+              echo "❌ p95 ${P95}ms exceeds 120 ms threshold — automatic rollback"
+              kubectl patch virtualservice recommendation-vs \
+                --namespace recommendation-prod \
+                --type=merge \
+                -p '{"spec":{"http":[{"route":[{"destination":{"host":"recommendation-stable"},"weight":100}]}]}}'
+              exit 1
+            fi
+
+            if (( $(echo "$ERROR_RATE > 0.001" | bc -l) )); then
+              echo "❌ Error rate ${ERROR_RATE} exceeds 0.1 % threshold — automatic rollback"
+              kubectl patch virtualservice recommendation-vs \
+                --namespace recommendation-prod \
+                --type=merge \
+                -p '{"spec":{"http":[{"route":[{"destination":{"host":"recommendation-stable"},"weight":100}]}]}}'
+              exit 1
+            fi
+          done
+          echo "✅ 30-minute canary window passed"
+
+  # ==============================================================
+  # JOB 6: Full Production Rollout
+  # Shifts 100 % of traffic to the new model version.
+  # ==============================================================
+  deploy-production:
+    name: Full Production Rollout
+    needs: deploy-canary
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://api.company.com
+    steps:
+      - name: Update stable deployment
+        run: |
+          kubectl set image deployment/recommendation-service-stable \
+            app=${{ needs.build-and-push.outputs.image_uri }} \
+            --namespace recommendation-prod
+          kubectl rollout status deployment/recommendation-service-stable \
+            --namespace recommendation-prod \
+            --timeout=300s
+
+      - name: Shift 100 % traffic to stable
+        run: |
+          kubectl patch virtualservice recommendation-vs \
+            --namespace recommendation-prod \
+            --type=merge \
+            -p '{"spec":{"http":[{"route":[{"destination":{"host":"recommendation-stable"},"weight":100}]}]}}'
+
+      - name: Production smoke test — verify model version
+        run: |
+          MODEL_VER=$(curl -s -I -X POST https://api.company.com/v1/recommend \
+            -H "Authorization: Bearer ${{ secrets.PROD_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"user_id":"usr-smoke-test","k":1}' \
+            | grep -i "x-model-version" | awk '{print $2}' | tr -d '\r')
+
+          EXPECTED="${{ needs.build-and-push.outputs.model_version }}"
+          echo "Active model version: ${MODEL_VER}"
+          echo "Expected: ${EXPECTED}"
+
+          if [ "${MODEL_VER}" != "${EXPECTED}" ]; then
+            echo "❌ Version mismatch: ${MODEL_VER} != ${EXPECTED}"
+            # This check mirrors the ModelVersionMismatch alert in monitoring/alerts.yaml.
+            exit 1
+          fi
+          echo "✅ Model version confirmed: ${MODEL_VER}"
+
+      - name: Notify Slack — success
+        if: success()
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
+            -H 'Content-type: application/json' \
+            -d "{\"text\":\"✅ Recommendation Service ${{ needs.build-and-push.outputs.model_version }} deployed to production successfully.\"}"
+
+      - name: Notify Slack — failure
+        if: failure()
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
+            -H 'Content-type: application/json' \
+            -d "{\"text\":\"❌ Recommendation Service deploy failed. On-call: follow runbooks/rollback.md\"}"
